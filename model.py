@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+from functools import partial
+from collections import OrderedDict
 
 
 class PatchEmbedding(nn.Module):
@@ -8,6 +10,9 @@ class PatchEmbedding(nn.Module):
 
         self.img_size = (img_size, img_size) if isinstance(img_size, int) else img_size # (int, int)型的list
         self.patch_size = (patch_size, patch_size) if isinstance(patch_size, int) else patch_size # (int, int)型的list
+
+        # patches总数, 在VisionTransformer类中定义位置编码token时会用到
+        self.num_patches = (self.img_size[0] // self.patch_size[0]) * (self.img_size[1] // self.patch_size[1])
 
         # 定义卷积层
         # input: [B, in_c, H, W] -> [B, dim_embedding, H_new, W_new] = [B, dim_embedding, H // patch_size, W // patch_size]
@@ -37,7 +42,7 @@ class PatchEmbedding(nn.Module):
 # Attention -> Dropout -> Output -> Dropout
 class Attention(nn.Module):
     def __init__(self,
-                 dim_token, # 输入token的dim
+                 dim_token, # 输入token的dim, ViT中通常为dim_embedding
                  num_heads=8,
                  qkv_bias=False, # 计算QKV时是否启用偏置 (因为此处QKV是通过FC层产生的, 而非公式中写的矩阵乘法, 当然本质是一样的)
                  qk_scale=None, # 公式 Attention = softmax(QK^T / \sqrt{d_k}) 中的\sqrt{d_k}, 若无输入则默认为1 / \sqrt{d_k}
@@ -158,3 +163,178 @@ class DropPath(nn.Module):
 
 
 
+# LayerNorm -> Multihead-Attention -> Dropout / DropPath -> Add (Residual)
+# -> LayerNorm -> MLP Block -> Dropout / DropPath -> Add (Residual)
+class Encoder_Block(nn.Module):
+    def __init__(self,
+                 dim_token,  # 输入token的dim, ViT中通常为dim_embedding
+                 num_heads, # Attention类, Multi-head个数
+                 qkv_bias=False,  # Attention类, 计算QKV时是否启用偏置
+                 qk_scale=None,  # Attention类
+                 attention_drop_ratio=0.,  # Attention类, 计算完attention后dropout概率
+                 drop_ratio=0.,   # Attention类 & MLP类, Attention类最后输出前dropout概率 & MLP类最后dropout概率
+                 mlp_ratio=4., # MLP类, 第一个FC层中hidden_features与in_features的比值
+                 active_layer=nn.GELU, # MLP类, 激活函数
+                 norm_layer=nn.LayerNorm, # 归一化层, 默认为LayerNorm
+                 drop_path_prob=0. # DropPath类, droppath概率
+                 ):
+        super().__init__()
+
+        # 与BatchNorm不同, LayerNorm适用于那些在不同样本之间难以直接比较的情况, 如Transformer中的自注意力机制
+        # 在这些模型中, 每个位置上的数据代表了不同的特征, 因此直接归一化可能会失去意义
+        # LayerNorm的解决方案是对每个样本的所有特征进行单独归一化, 而不是基于整个批次
+        self.norm1 = norm_layer(dim_token)
+
+        self.attention = Attention(dim_token, num_heads, qkv_bias, qk_scale, attention_drop_ratio, drop_ratio)
+
+        self.drop_path = DropPath(drop_path_prob) if drop_path_prob > 0. else nn.Identity()
+
+        self.norm2 = norm_layer(dim_token)
+
+        hidden_features = int(dim_token * mlp_ratio)
+        self.mlp = MLP(in_features=dim_token, hidden_features=hidden_features,active_layer=active_layer, dropout=drop_ratio)
+
+
+    # X: [B, N, C] = [Batch, num_patches + 1, dim_token (dim_embedding)]
+    def forward(self, X):
+        X = X + self.drop_path(self.attention(self.norm1(X))) # 第一个Add (Residual)层
+        X = X + self.drop_path(self.mlp(self.norm2(X))) # 第二个Add (Residual)层
+        return X
+
+
+
+class VisionTransformer(nn.Module):
+    def __init__(self,
+                 img_size=224,
+                 patch_size=16,
+                 in_channels=3,
+                 dim_embedding=768,
+                 embedding_norm_layer=None,
+                 num_heads=12,  # Attention类, Multi-head个数
+                 qkv_bias=False,  # Attention类, 计算QKV时是否启用偏置
+                 qk_scale=None,  # Attention类
+                 attention_drop_ratio=0.,  # Attention类, 计算完attention后dropout概率
+                 drop_ratio=0.,  # 位置编码 & Attention类 & MLP类, 位置编码后dropout概率 & Attention类最后输出前dropout概率 & MLP类最后dropout概率
+                 mlp_ratio=4.,  # MLP类, 第一个FC层中hidden_features与in_features的比值
+                 active_layer=None,  # MLP类, 激活函数, 默认为nn.GELU
+                 norm_layer=None,  # Encoder_Block类 & MLP Head前, 归一化层, 默认为LayerNorm
+                 drop_path_prob=0.,  # DropPath类, DropPath概率
+                 representation_size=None, # MLP Head, Pre-Logits里Linear层的out_features个数, 默认None即没有Pre-Logits层
+                 embedding_layer=PatchEmbedding, # Patch-Embedding层选用什么结构
+                 num_classes=1000, # 最后分类的种类数
+                 depth=12 # Encoder_Block重复次数
+                 ):
+        super().__init__()
+
+        self.num_classes = num_classes # 最后分类的种类数
+        self.num_features = self.dim_embedding = dim_embedding # num_features是用于最后MLP Head的最后那个Linear层的输入特征数
+        self.num_extra_tokens = 1 # 额外的token数, 这里1表示token for classification
+
+        # 用partial方法提前指定部分参数, 使得调用时输入参数减少 (详见https://blog.csdn.net/qq_39450134/article/details/121871432)
+        norm_layer = norm_layer or partial(nn.LayerNorm, eps=1e-6)
+        active_layer = active_layer or nn.GELU
+
+        # 开始构建网络架构, 先是Patch-Embedding层
+        self.patch_embedding = embedding_layer(img_size, patch_size, in_channels, dim_embedding, embedding_norm_layer)
+        num_patches = self.patch_embedding.num_patches # patches总数
+
+        # 定义class token & 位置编码 (position embedding)
+        self.class_token = nn.Parameter(torch.zeros(1, 1, dim_embedding)) # [1, 1, dim_embedding]
+        self.position_embedding = nn.Parameter(torch.zeros(1, num_patches + self.num_extra_tokens, dim_embedding)) # [1, num_patches + 1, dim_embedding]
+
+        # 加上位置编码 (position embedding)后的Dropout层
+        self.position_dropout = nn.Dropout(p=drop_ratio)
+
+        # Encoder_Block (重复depth次)
+
+        # 先来设置每个Encoder_Block里Dropout/DropPath的概率, 每个Block的概率是不同的, 越往后Dropout/DropPath概率越大
+        # 用等差递增数列来定义每个Block的DropPath概率, 最大值为输入的drop_path_ratio (默认为0, 即不采用Dropout/DropPath)
+        # 储存为list而非直接"torch.linspace()"存为tensor的原因：
+        #     - 1. 避免设备（Device）不匹配问题：使用列表推导式list是创建在内存上, 与设备无关；而tensor是默认创建在CPU上
+        #     - 2. 避免不必要的计算图保留：torch.Tensor 会保留计算历史 (用于反向传播), 即使你并不需要, 而且用list还能避免意外梯度计算
+        drop_path_prob = [x.item() for x in torch.linspace(0, drop_path_prob, depth)]
+
+        # *[]是解包操作, 将此处的Block组成的list拆解为一个个独立的Block (共depth个)
+        self.Encoder_Blocks = nn.Sequential(*[
+            Encoder_Block(dim_token=dim_embedding, num_heads=num_heads, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                          attention_drop_ratio=attention_drop_ratio, drop_ratio=drop_ratio, mlp_ratio=mlp_ratio,
+                          active_layer=active_layer, norm_layer=norm_layer, drop_path_prob=drop_path_prob[i])
+            for i in range(depth)
+        ])
+
+        # Encoder后的归一化层 (默认为LayerNorm)
+        self.norm = norm_layer(dim_embedding)
+
+        # MLP Head块
+        # 先是Pre-Logits (如果需要的话), Linear -> tanh
+        if representation_size is not None:
+            self.has_logits = True # 保存模型结构信息, 在后续训练时会用到
+            self.num_features = representation_size
+            self.pre_logits = nn.Sequential(OrderedDict([
+                ('fc', nn.Linear(dim_embedding, representation_size)),
+                ('act', nn.Tanh())
+            ]))
+        else:
+            self.has_logits = False
+            self.pre_logits = nn.Identity()
+
+        # MLP Head最后的Linear层
+        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+
+        # 初始化参数
+        nn.init.trunc_normal_(self.class_token, std=0.02) # 截断的正态分布, 标准差std=0.02, 默认范围：[a, b] = [-2., 2.]
+        nn.init.trunc_normal_(self.position_embedding, std=0.02)
+        self.apply(_init_vit_weights)
+
+    # X: [B, C, H, W]
+    def forward(self, X):
+        # patch_embedding: [B, C, H, W] -> [B, num_patches, dim_embedding]
+        X = self.patch_embedding(X) # [B, num_patches, dim_embedding]
+
+        # repeat: [1, 1, dim_embedding] -> [B, 1, dim_embedding]
+        self.class_token = self.class_token.repeat([X.shape[0], 1, 1]) # [B, 1, dim_embedding]
+
+        # concat一个token for classification
+        X = torch.cat((self.class_token, X), dim=1) # [B, num_patches + 1, dim_embedding]
+
+        # 加上位置编码 (position embedding) & Dropout
+        X = self.position_dropout(X + self.position_embedding) # [B, num_patches + 1, dim_embedding]
+
+        # Encoder_Blocks
+        X = self.Encoder_Blocks(X) # [B, num_patches + 1, dim_embedding]
+
+        # 归一化 (默认LayerNorm)
+        X = self.norm(X) # [B, num_patches + 1, dim_embedding]
+
+        # MLP Head块
+        # 单独取出class token, 先通过Pre-Logits
+        # X[:, 0]: [B, 1, dim_embedding]
+        X = self.pre_logits(X[:, 0]) # [B, 1, num_features]
+
+        # MLP Head -- Linear
+        X = self.head(X) # [B, 1, num_classes]
+
+        return X
+
+
+
+# 初始化VisionTransformer类的参数
+def _init_vit_weights(m):
+    if isinstance(m, nn.Linear):
+        nn.init.trunc_normal_(m.weight, std=0.01)
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    elif isinstance(m, nn.Conv2d):
+        # mode="fan_in"：当你更关心前向传播过程中激活值的方差稳定性时使用
+        # mode="fan_out"：当你更关心反向传播过程中梯度的方差稳定性时使用
+        # 对于普通的前馈网络, 两者差异不大, 通常默认使用 fan_in
+        # 对于需要特别稳定梯度流动的网络 (如很深的网络或Transformer), fan_out 可能更合适
+        # 对于一些特殊结构 (如残差连接), 可能需要调整模式
+        nn.init.kaiming_normal_(m.weight, mode='fan_out')
+        if m.bias is not None:
+            nn.init.zeros_(m.bias)
+
+    elif isinstance(m, nn.LayerNorm):
+        nn.init.zeros_(m.bias)
+        nn.init.ones_(m.weight)
